@@ -21,6 +21,20 @@ def read_int(path, default=0):
         return default
 
 
+def read_memory_events():
+    """cgroup v2 memory.events — {'low':N, 'high':N, 'max':N, 'oom':N, 'oom_kill':N}."""
+    events = {}
+    try:
+        with open("/sys/fs/cgroup/memory.events") as f:
+            for line in f:
+                key, _, val = line.strip().partition(" ")
+                if key:
+                    events[key] = int(val)
+    except (FileNotFoundError, ValueError):
+        pass
+    return events
+
+
 def read_cpu_usec():
     try:
         with open("/sys/fs/cgroup/cpu.stat") as f:
