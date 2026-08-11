@@ -121,3 +121,62 @@ def du_scan(path=APP_DATA_PATH, top_n=5, timeout=60):
 
     entries.sort(key=lambda e: e[2], reverse=True)
     return total, entries[:top_n]
+
+
+def tmux_sessions():
+    """[(name, pane_pid), ...] — one row per pane, from tmux's own state.
+
+    Used to attribute processes to their tmux session even though a plain
+    `ps`/psutil view has no concept of "this belongs to session X" — tmux
+    itself is the only source of that mapping (via each pane's shell PID).
+    """
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["tmux", "list-panes", "-a", "-F", "#{session_name}\t#{pane_pid}"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return []
+    sessions = []
+    for line in out.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 2 and parts[1].isdigit():
+            sessions.append((parts[0], int(parts[1])))
+    return sessions
+
+
+def tmux_session_details():
+    """[(name, windows, attached), ...] — one row per session (not per pane)."""
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["tmux", "list-sessions", "-F", "#{session_name}\t#{session_windows}\t#{session_attached}"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return []
+    details = []
+    for line in out.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 3:
+            details.append((parts[0], parts[1], parts[2] == "1"))
+    return details
+
+
+def tmux_pid_session_map():
+    """{pid: session_name} for every process descending from a tmux pane's
+    shell — not just the pane's own PID, since the actual work (a python
+    script, a server, etc.) usually runs as a child of that shell."""
+    mapping = {}
+    for name, pane_pid in tmux_sessions():
+        try:
+            pane_proc = psutil.Process(pane_pid)
+        except psutil.Error:
+            continue
+        mapping[pane_pid] = name
+        for child in pane_proc.children(recursive=True):
+            mapping[child.pid] = name
+    return mapping

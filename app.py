@@ -10,26 +10,32 @@ import json
 import os
 import signal
 import sqlite3
+import subprocess
 import time
 from collections import deque
 from datetime import datetime
 
 import psutil
 from textual_plotext import PlotextPlot
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, SuspendNotSupported
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, Checkbox, DataTable, Footer, Header, Input, Label, Sparkline, Static
+from textual.widgets import (
+    Button, Checkbox, DataTable, Footer, Header, Input, Label,
+    Sparkline, Static, TabbedContent, TabPane,
+)
 
 from cleanup import ASK_FIRST_ITEMS, SAFE_ITEMS, delete_items, item_sizes
 from common import (
     APP_DATA_PATH, DB_PATH, du_scan, human_bytes, net_bytes,
     read_cpu_usec, read_int, read_memory_events,
+    tmux_pid_session_map, tmux_session_details,
 )
 
 HISTORY_LEN = 120
 REFRESH_SECONDS = 1.0
+SHELL_SENTINEL = "+ New Shell"
 
 
 class StatBox(Static):
@@ -299,6 +305,8 @@ class Solvetop(App):
     #filter_bar { height: auto; padding: 0 1; display: none; }
     #filter_input { width: 1fr; }
     #filter_count { width: auto; content-align: left middle; padding: 0 1; }
+    #main_tabs { height: 1fr; }
+    #session_table { height: 1fr; }
     #proc_table { height: 1fr; }
     """
 
@@ -328,6 +336,7 @@ class Solvetop(App):
         self.prev_ts = time.monotonic()
         self.prev_rx, self.prev_tx = net_bytes()
         self.last_pids = []
+        self.last_sessions = []
         self.last_create_times = {}  # pid -> create_time, kept even after a process exits
         self.last_names = {}  # pid -> process name, kept even after a process exits
         self._fresh_disk = None  # (total_bytes, computed_at, top_dirs) set by a manual cleanup rescan
@@ -398,17 +407,32 @@ class Solvetop(App):
             yield Button("Clean Safe Cache ('s')", id="btn_clean_safe", variant="success")
             yield Button("Review & Clean ('a')", id="btn_clean_ask", variant="warning")
             yield Static("", id="cleanup_status")
-        with Horizontal(id="filter_bar"):
-            yield Input(placeholder="Filter processes... (Enter to apply, Escape to clear)", id="filter_input")
-            yield Static("", id="filter_count")
-        yield DataTable(id="proc_table")
+        with TabbedContent(id="main_tabs"):
+            with TabPane("Processes", id="tab_processes"):
+                with Horizontal(id="filter_bar"):
+                    yield Input(
+                        placeholder="Filter processes... (Enter to apply, Escape to clear)",
+                        id="filter_input",
+                    )
+                    yield Static("", id="filter_count")
+                yield DataTable(id="proc_table")
+            with TabPane("Sessions", id="tab_sessions"):
+                yield Label(
+                    "Enter on a session to attach, or '+ New Shell' for a plain shell "
+                    "— Ctrl-b d / exit to come back here"
+                )
+                yield DataTable(id="session_table")
         yield Footer()
 
     def on_mount(self):
         table = self.query_one("#proc_table", DataTable)
-        table.add_columns("PID", "USER", "RSS", "%MEM", "%CPU", "TIME", "COMMAND")
+        table.add_columns("PID", "SESSION", "USER", "RSS", "%MEM", "%CPU", "TIME", "COMMAND")
         table.cursor_type = "row"
         table.focus()
+
+        session_table = self.query_one("#session_table", DataTable)
+        session_table.add_columns("SESSION", "WINDOWS", "ATTACHED", "RSS", "CPU%")
+        session_table.cursor_type = "row"
 
         self.set_interval(REFRESH_SECONDS, self.refresh_stats)
         self.refresh_stats()
@@ -699,6 +723,8 @@ class Solvetop(App):
         self.refresh_processes()
 
     def refresh_processes(self):
+        pid_session = tmux_pid_session_map()
+
         rows = []
         seen = set()
         for p in psutil.process_iter(["pid"]):
@@ -723,7 +749,8 @@ class Solvetop(App):
                 self.last_names[pid] = proc.name()
             except psutil.Error:
                 continue
-            rows.append((pid, user, mem, cpu, total_time, cmd))
+            session = pid_session.get(pid, "-")
+            rows.append((pid, session, user, mem, cpu, total_time, cmd))
 
         for pid in list(self.proc_cache):
             if pid not in seen:
@@ -731,13 +758,19 @@ class Solvetop(App):
         # last_create_times deliberately isn't pruned on exit — history for a
         # process that just died is still worth looking at via 'i'.
 
+        # Session totals are computed over *every* matching process, before
+        # the filter/top-30 cap below — a session's real footprint shouldn't
+        # depend on whether its processes happened to rank in the visible
+        # slice of the (separate) process table.
+        self._refresh_sessions(rows)
+
         total_mem = psutil.virtual_memory().total
-        key = (lambda r: r[2]) if self.sort_by == "mem" else (lambda r: r[3])
+        key = (lambda r: r[3]) if self.sort_by == "mem" else (lambda r: r[4])
         rows.sort(key=key, reverse=True)
 
         if self.filter_text:
             needle = self.filter_text.lower()
-            rows = [r for r in rows if needle in r[5].lower()]
+            rows = [r for r in rows if needle in r[6].lower()]
             self.query_one("#filter_count", Static).update(f"{len(rows)} match(es)")
 
         rows = rows[:30]
@@ -757,10 +790,10 @@ class Solvetop(App):
 
         table.clear()
         new_pids = [r[0] for r in rows]
-        for pid, user, mem, cpu, total_time, cmd in rows:
+        for pid, session, user, mem, cpu, total_time, cmd in rows:
             mins, secs = divmod(int(total_time), 60)
             table.add_row(
-                str(pid), user, human_bytes(mem),
+                str(pid), session, user, human_bytes(mem),
                 f"{mem / total_mem * 100:.1f}", f"{cpu:.1f}",
                 f"{mins}:{secs:02d}", cmd[:60],
             )
@@ -771,6 +804,63 @@ class Solvetop(App):
                 table.move_cursor(row=new_pids.index(selected_pid))
             else:
                 table.move_cursor(row=min(selected_row, len(new_pids) - 1))
+
+    def _refresh_sessions(self, all_rows):
+        totals = {}  # name -> [rss_sum, cpu_sum]
+        for pid, session, user, mem, cpu, total_time, cmd in all_rows:
+            if session == "-":
+                continue
+            t = totals.setdefault(session, [0, 0.0])
+            t[0] += mem
+            t[1] += cpu
+
+        details = {name: (windows, attached) for name, windows, attached in tmux_session_details()}
+        names = sorted(details.keys())
+
+        table = self.query_one("#session_table", DataTable)
+        selected_row = table.cursor_row
+        selected_name = (
+            self.last_sessions[selected_row]
+            if 0 <= selected_row < len(self.last_sessions)
+            else None
+        )
+
+        table.clear()
+        table.add_row(SHELL_SENTINEL, "-", "-", "-", "-")
+        for name in names:
+            windows, attached = details[name]
+            rss_sum, cpu_sum = totals.get(name, (0, 0.0))
+            table.add_row(
+                name, windows, "yes" if attached else "no",
+                human_bytes(rss_sum), f"{cpu_sum:.1f}",
+            )
+        self.last_sessions = [SHELL_SENTINEL] + names
+
+        if selected_name in self.last_sessions:
+            table.move_cursor(row=self.last_sessions.index(selected_name))
+        else:
+            table.move_cursor(row=min(max(selected_row, 0), len(self.last_sessions) - 1))
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id != "session_table":
+            return
+        row = event.cursor_row
+        if not (0 <= row < len(self.last_sessions)):
+            return
+        name = self.last_sessions[row]
+        is_shell = name == SHELL_SENTINEL
+        try:
+            with self.suspend():
+                if is_shell:
+                    subprocess.run([os.environ.get("SHELL", "/bin/bash")])
+                else:
+                    subprocess.run(["tmux", "attach-session", "-t", name])
+        except SuspendNotSupported:
+            what = "open a shell" if is_shell else "attach"
+            self._set_status(f"Can't {what} — this terminal doesn't support suspending the app.")
+            return
+        label = "shell" if is_shell else f"tmux session '{name}'"
+        self._set_status(f"Back from {label}.")
 
 
 if __name__ == "__main__":
